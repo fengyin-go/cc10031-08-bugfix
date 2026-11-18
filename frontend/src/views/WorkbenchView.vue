@@ -86,6 +86,105 @@
       </form>
     </div>
 
+    <section v-if="meta.key === 'data_extract'" class="extract-panel" data-testid="extract-admission-panel">
+      <header class="panel-head">
+        <div>
+          <h3>站点规则准入台账</h3>
+          <p class="panel-desc">
+            仅「已生效」提取规则参与采集；无准入规则的站点保留阻塞状态，不静默降级。
+            每个字段映射记录实际命中的规则版本，明细持久保存，重新进入页面仍是同一份。
+          </p>
+        </div>
+        <div class="page-actions">
+          <button class="btn primary" data-testid="extract-collect" type="button" @click="runCollect">
+            执行采集（消费待处理源配置）
+          </button>
+          <button class="btn ghost" data-testid="extract-refresh" type="button" @click="reloadExtractSites">
+            刷新准入状态
+          </button>
+        </div>
+      </header>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>站点</th>
+            <th>准入状态</th>
+            <th>命中规则版本</th>
+            <th>阻塞原因</th>
+            <th>待处理源配置</th>
+            <th>明细版本</th>
+            <th>处理状态</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="site in extractSites" :key="site.site" :data-testid="`extract-site-${site.site}`">
+            <td>{{ site.site }}</td>
+            <td>
+              <span class="admission-tag" :data-state="site.admission">{{ site.admission }}</span>
+            </td>
+            <td>{{ formatRuleVersions(site) }}</td>
+            <td>{{ site.blocked_reason ?? '—' }}</td>
+            <td>{{ site.pending_source_configs }}</td>
+            <td>{{ site.detail ? `v${site.detail.version}` : '—' }}</td>
+            <td>{{ site.detail?.process_state ?? '待处理' }}</td>
+            <td class="row-actions">
+              <button class="link" type="button" :data-testid="`extract-detail-${site.site}`" @click="openExtractDetail(site.site)">
+                采集明细
+              </button>
+              <button class="link" type="button" :data-testid="`extract-reevaluate-${site.site}`" @click="reevaluateSite(site.site)">
+                重新评估
+              </button>
+            </td>
+          </tr>
+          <tr v-if="!extractSites.length">
+            <td colspan="8" class="empty-state">暂无站点准入记录，可先发布页面模型源端配置</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <div v-if="showExtractDetail" class="modal-backdrop" data-testid="extract-detail-modal">
+      <div class="modal extract-detail-modal">
+        <h3>字段映射采集明细 — {{ extractDetail?.site }}</h3>
+        <p class="detail-meta">
+          准入：{{ extractDetail?.admission }} ｜ 准入策略：{{ extractDetail?.rule_policy }} ｜
+          明细版本：v{{ extractDetail?.version }} ｜ 批次：{{ extractDetail?.batch_ref ?? '—' }} ｜
+          处理状态：{{ extractDetail?.process_state }}
+        </p>
+        <p v-if="extractDetail?.blocked_reason" class="error-text">
+          阻塞原因：{{ extractDetail.blocked_reason }}
+        </p>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>字段</th>
+              <th>命中</th>
+              <th>命中规则</th>
+              <th>规则版本</th>
+              <th>规则状态</th>
+              <th>字段来源</th>
+              <th>备注</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="mapping in extractDetail?.field_mappings ?? []" :key="mapping.field">
+              <td>{{ mapping.field }}</td>
+              <td>{{ mapping.hit ? '命中' : '未命中' }}</td>
+              <td>{{ mapping.rule_name ?? '—' }}</td>
+              <td>{{ mapping.rule_version ?? '—' }}</td>
+              <td>{{ mapping.rule_status ?? '—' }}</td>
+              <td>{{ mapping.origin }}</td>
+              <td>{{ mapping.note ?? '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="page-actions">
+          <button class="btn" data-testid="extract-detail-close" type="button" @click="showExtractDetail = false">关闭</button>
+        </div>
+      </div>
+    </div>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -100,10 +199,15 @@ import {
   createEntry,
   downloadEntries,
   listEntries,
+  loadExtractSiteDetail,
+  loadExtractSites,
   moduleMeta,
+  reevaluateExtractSite,
   runAction as applyAction,
+  runExtractCollect,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import type { ExtractSiteAdmission, FieldMappingDetail } from '@/api/backend-service'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -115,6 +219,9 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const extractSites = ref<ExtractSiteAdmission[]>([])
+const extractDetail = ref<(FieldMappingDetail & { site: string }) | null>(null)
+const showExtractDetail = ref(false)
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -187,5 +294,118 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+function formatRuleVersions(site: ExtractSiteAdmission): string {
+  if (!site.admitted_rules.length) return '—'
+  return site.admitted_rules
+    .map((rule) => `${rule.rule_name ?? rule.rule_id} v${rule.rule_version}`)
+    .join('、')
+}
+
+async function reloadExtractSites() {
+  if (meta.key !== 'data_extract') return
+  try {
+    extractSites.value = await loadExtractSites()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '站点准入状态读取失败'
+  }
+}
+
+async function openExtractDetail(site: string) {
+  errorMessage.value = ''
+  try {
+    const detail = await loadExtractSiteDetail(site)
+    if (!detail) {
+      errorMessage.value = `站点 ${site} 尚无字段映射采集明细，等待源配置处理`
+      return
+    }
+    extractDetail.value = { ...detail, site }
+    showExtractDetail.value = true
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '采集明细读取失败'
+  }
+}
+
+async function reevaluateSite(site: string) {
+  errorMessage.value = ''
+  try {
+    const result = await reevaluateExtractSite(site)
+    if (!result.ok) throw new Error('重新评估未通过')
+    await reloadExtractSites()
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '重新评估失败'
+  }
+}
+
+async function runCollect() {
+  errorMessage.value = ''
+  try {
+    await runExtractCollect()
+    await reloadExtractSites()
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '采集执行失败'
+  }
+}
+
+onMounted(() => {
+  void reload()
+  void reloadExtractSites()
+})
 </script>
+
+<style scoped>
+.extract-panel {
+  margin-top: 18px;
+  border-top: 1px dashed var(--border);
+  padding-top: 14px;
+}
+
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.panel-head h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+
+.panel-desc {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  max-width: 640px;
+}
+
+.admission-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: #eef2ff;
+  color: #3730a3;
+}
+
+.admission-tag[data-state='已阻塞'] {
+  background: #fef2f2;
+  color: #b42318;
+}
+
+.admission-tag[data-state='已准入(历史版本)'] {
+  background: #fff7ed;
+  color: #9a3412;
+}
+
+.extract-detail-modal {
+  width: min(860px, 100%);
+}
+
+.detail-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+</style>

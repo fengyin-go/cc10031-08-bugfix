@@ -276,6 +276,139 @@ class CollectRecordStore:
 
 
 # ---------------------------------------------------------------------------
+# 规则版本档案 (RuleVersionArchive) — 站点上一已生效规则版本快照
+# ---------------------------------------------------------------------------
+
+class RuleVersionArchive:
+    """保存每个站点最近一次「已生效」提取规则的版本快照。
+
+    数据提取准入规则：只有「已生效」规则可以参与采集。当站点当前只剩
+    草稿/已测试规则、但历史批次仍可读取时，允许回退到上一已生效版本
+    继续采集；草稿规则在任何方案下都不会进入新的采集明细。
+
+    用法::
+
+        store.rule_archive.put("站点A", {"rule_id": 3, "rule_version": 2, ...})
+        snapshots = store.rule_archive.all()
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._items: dict[tuple[str, int], dict[str, Any]] = {}
+
+    def put(self, site_key: str, snapshot: dict[str, Any]) -> None:
+        """登记/覆盖某站点某规则的已生效版本快照。"""
+        with self._lock:
+            key = (site_key, int(snapshot.get("rule_id", 0)))
+            self._items[key] = dict(snapshot)
+
+    def all(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._items.values()]
+
+    def remove_rule(self, site_key: str, rule_id: int) -> None:
+        with self._lock:
+            self._items.pop((site_key, int(rule_id)), None)
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            by_site: dict[str, int] = {}
+            for (site_key, _), _item in self._items.items():
+                by_site[site_key] = by_site.get(site_key, 0) + 1
+            return {"total": len(self._items), "by_site": by_site}
+
+
+# ---------------------------------------------------------------------------
+# 字段映射采集明细台账 (FieldMappingLedger) — 每站点一份，版本号控制并发
+# ---------------------------------------------------------------------------
+
+class FieldMappingLedger:
+    """字段映射采集明细台账：按站点持久保存最近一次采集的字段映射明细。
+
+    每条明细记录每个字段实际命中的已生效规则版本，以及站点的准入状态、
+    阻塞原因。写入采用乐观版本控制：
+
+    - ``expected_version`` 与当前版本一致才接受写入（新站点传 0/None）；
+    - 并发再次写入只接受一个版本，冲突方被拒绝，站点处理状态被推进
+      终态 ``冲突终止``，需显式 ``reset_terminal`` 后才能继续写入。
+    """
+
+    #: 处理终态：并发写入冲突后站点源配置进入的终止状态
+    CONFLICT_STATE = "冲突终止"
+    PROCESS_STATES = ("待处理", "已准入", "已阻塞", CONFLICT_STATE)
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._records: dict[str, dict[str, Any]] = {}
+
+    def get(self, site: str) -> dict[str, Any] | None:
+        with self._lock:
+            record = self._records.get(site)
+            return dict(record) if record else None
+
+    def list(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(r) for r in self._records.values()]
+
+    def upsert(
+        self,
+        site: str,
+        detail: dict[str, Any],
+        expected_version: int | None,
+    ) -> tuple[str, dict[str, Any]]:
+        """版本受控写入。返回 ("ok" | "conflict" | "terminated", record)。"""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            current = self._records.get(site)
+            if current is not None and current.get("process_state") == self.CONFLICT_STATE:
+                return "terminated", dict(current)
+            if current is None:
+                if expected_version not in (None, 0):
+                    return "conflict", {}
+                version = 1
+            else:
+                if expected_version != current.get("version"):
+                    # 并发再次写入只接受一个版本：冲突方被拒绝，
+                    # 站点源配置处理状态推进终态。
+                    current["process_state"] = self.CONFLICT_STATE
+                    current["updated_at"] = now
+                    return "conflict", dict(current)
+                version = int(current.get("version", 0)) + 1
+            record = {
+                **detail,
+                "site": site,
+                "version": version,
+                "created_at": current.get("created_at") if current else now,
+                "updated_at": now,
+            }
+            self._records[site] = record
+            return "ok", dict(record)
+
+    def reset_terminal(self, site: str) -> bool:
+        """显式解除冲突终态（重新评估/重新发布源配置时调用）。"""
+        with self._lock:
+            current = self._records.get(site)
+            if current is None or current.get("process_state") != self.CONFLICT_STATE:
+                return False
+            current["process_state"] = "待处理"
+            current["updated_at"] = datetime.now(timezone.utc).isoformat()
+            return True
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            by_state: dict[str, int] = {}
+            for record in self._records.values():
+                state = record.get("process_state", "待处理")
+                by_state[state] = by_state.get(state, 0) + 1
+            return {"total": len(self._records), "by_state": by_state}
+
+
+# ---------------------------------------------------------------------------
 # 失败恢复管理 (FailureRecovery)
 # ---------------------------------------------------------------------------
 
@@ -372,6 +505,8 @@ class Store:
         self.dirty_vault = DirtyDataVault()
         self.collect_records = CollectRecordStore()
         self.recovery = FailureRecovery()
+        self.rule_archive = RuleVersionArchive()
+        self.field_mapping_ledger = FieldMappingLedger()
 
     # ---- 基础数据操作 ----
 

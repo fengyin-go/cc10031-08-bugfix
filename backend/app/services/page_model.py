@@ -50,6 +50,11 @@ class PageModelService(BaseModuleService):
         entry["status"] = "已使用"
         entry["pending"] = False
 
+        # 重新发布源配置 = 开启新一轮处理：解除该站点可能存在的冲突终态
+        site = str(entry.get("目标站点") or "")
+        if site:
+            store.field_mapping_ledger.reset_terminal(site)
+
         # 构造源端配置
         source_config = {
             "model_id": model_id,

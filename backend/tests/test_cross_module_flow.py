@@ -138,6 +138,18 @@ def test_collection_validation_flow():
     assert len(model_msgs) > 0, "没有 source_configured 消息"
     print(f"  [OK] 源端配置发布: {len(model_msgs)} 条")
 
+    # 规则准入修复后，站点必须有已生效提取规则才会采集
+    # （草稿/已测试规则不再被兜底拼接，无准入规则的站点保留阻塞）。
+    # 这里为发布的站点启用一条已生效规则，模拟运营完成规则准入。
+    site = model_msgs[-1]["payload"].get("target_site")
+    rule_rows = store.rows("data_extract")
+    effective = next(
+        (r for r in rule_rows if r.get("status") == "已生效"), None)
+    if effective is None:
+        effective = rule_rows[0]
+        effective["status"] = "已生效"
+    effective["源页面结构"] = site
+
     # Step 2: 执行数据采集
     extract_result = extract_svc.consume_source_and_extract()
     print(f"  [OK] 数据采集: extracted={extract_result['extracted']}, dirty={extract_result['dirty']}")

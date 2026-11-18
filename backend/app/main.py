@@ -228,6 +228,58 @@ def pipeline_element_execution() -> dict[str, object]:
     return {"ok": True, "result": result}
 
 
+# ---- 数据提取工作台：站点规则准入视图 ----
+
+@app.get("/api/extract-workbench/sites")
+def extract_workbench_sites() -> dict[str, object]:
+    """按站点查看规则准入状态、命中规则版本和阻塞原因。
+
+    业务清单（提取规则）与结果台账（字段映射采集明细）同源输出，
+    重新进入页面仍能看到同一份持久保存的明细版本。
+    """
+    from app.services import DataExtractService
+
+    svc = DataExtractService()
+    sites = svc.site_admission_overview()
+    return {"count": len(sites), "sites": sites}
+
+
+@app.get("/api/extract-workbench/sites/{site}/detail")
+def extract_workbench_site_detail(site: str) -> dict[str, object]:
+    """读取站点持久保存的字段映射采集明细。"""
+    from app.services import DataExtractService
+
+    svc = DataExtractService()
+    detail = svc.get_site_detail(site)
+    if detail is None:
+        return {"site": site, "detail": None,
+                "message": "站点尚无字段映射采集明细，等待源配置处理"}
+    return {"site": site, "detail": detail}
+
+
+@app.post("/api/extract-workbench/collect")
+def extract_workbench_collect() -> dict[str, object]:
+    """消费待处理页面源配置：规则准入 + 采集 + 写入字段映射采集明细。"""
+    from app.services import DataExtractService
+
+    svc = DataExtractService()
+    result = svc.consume_source_and_extract()
+    return {"ok": True, "result": result}
+
+
+@app.post("/api/extract-workbench/reevaluate")
+def extract_workbench_reevaluate(payload: dict[str, str]) -> dict[str, object]:
+    """重新评估站点准入（规则启用后解除阻塞 / 冲突终态后显式重处理）。"""
+    from app.services import DataExtractService
+
+    site = (payload or {}).get("site", "").strip()
+    if not site:
+        return {"ok": False, "message": "缺少站点参数"}
+    svc = DataExtractService()
+    result = svc.reevaluate_site(site)
+    return {"ok": result["outcome"] == "ok", "result": result}
+
+
 # 资源路由含 /api/{module}，必须放在 health / overview 之后注册，
 # 否则固定路径会被动态路径抢先匹配。
 for module in ROUTERS:
